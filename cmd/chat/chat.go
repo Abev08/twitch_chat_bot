@@ -14,21 +14,19 @@ import (
 
 // Temporary variables, should be in some sort of config package
 
-var PASS string = "" // OAuth token
-var NICK string = "AbevBot" // Chat bot nick
-var CHANNEL_NAME string = "AbevBot" // Channel name
-
-
-
+var PASS string = ""         // OAuth token
+var NICK string = ""         // Chat bot nick
+var CHANNEL_NAME string = "" // Channel name
 
 var PrintChatMessages = true // Should chat messages be printed to stdout?
 
 const messageSendCooldown = time.Millisecond * 200 // Minimum 200ms between messages sent
-var messageStart = []byte("@badge") // Byte array describing chat message start
-var messageEnd = []byte("\r\n") // Byte array describing chat message end
-var sendQueue messageQueue // Queue of chat messages to send to chat
-var isStarted bool // Is the chat bot started?
-var chatMessagesSinceLastPeriodicMessage uint16 // Amount of chat messages since last periodic message
+const messageSendMaxLength = 460                   // Maximum number of characters in one message. 500 characters Twitch limit, -40 characters as a buffer
+var messageStart = []byte("@badge")                // Byte array describing chat message start
+var messageEnd = []byte("\r\n")                    // Byte array describing chat message end
+var sendQueue messageQueue                         // Queue of chat messages to send to chat
+var isStarted bool                                 // Is the chat bot started?
+var chatMessagesSinceLastPeriodicMessage uint16    // Amount of chat messages since last periodic message
 
 // Starts the chat bot.
 func Start() {
@@ -98,6 +96,7 @@ func update() {
 				}
 			} else {
 				// Check if received data starts with message start
+				zeroBytesReceivedCounter = 0
 				var newMessage = true
 				for i, v := range messageStart {
 					if receiveBuffer[i] != v {
@@ -107,17 +106,22 @@ func update() {
 				}
 
 				// Look through received data and look for message end
-				var start, end int
+				var start, end, endIdx int
+				var endFound = false
 				for i := 0; i < n; i++ {
-					var endFound = true
-					for j, v := range messageEnd {
-						if receiveBuffer[i+j] != v {
-							endFound = false
-							break
+					if receiveBuffer[i] == messageEnd[endIdx] {
+						endIdx++
+						if endIdx >= len(messageEnd) {
+							endFound = true
 						}
+					} else {
+						endIdx = 0
 					}
+
 					if endFound {
-						i += len(messageEnd) // Add message end len
+						i++
+						endFound = false
+						endIdx = 0
 						end = i
 						if end-start <= 2 {
 							// Just an empty "\r\n", skip
@@ -370,7 +374,7 @@ func processMessage(header, body, msg string, metadata messageMetadata) {
 
 	case "USERSTATE":
 		if PrintChatMessages {
-			fmt.Printf("BOT %20s: %s\n", metadata.UserName, body)
+			fmt.Printf("BOT %20s: %s (bot's message)\n", metadata.UserName, body)
 		}
 
 	default:
@@ -396,32 +400,43 @@ func SendMessageResponse(msg, msgID string) {
 	if !isStarted || len(msg) == 0 {
 		return
 	}
-
 	var sb strings.Builder
-	// int start = 0;
-	// int end = message.Length > MESSAGESENTMAXLEN ? MESSAGESENTMAXLEN : message.Length;
+	var start, end int
 
-	// while (true)
-	// {
-	//   sb.Clear();
-	if len(msgID) > 0 {
-		sb.WriteString("@reply-parent-msg-id=")
-		sb.WriteString(msgID)
-		sb.WriteString(" ")
+	sendQueue.mutex.Lock()
+
+	for {
+		// Find message end or place to split the message
+		end = len(msg)
+		if (end - start) > messageSendMaxLength {
+			end = strings.LastIndex(msg[:(start+messageSendMaxLength)], " ")
+			if end == -1 {
+				end = messageSendMaxLength
+			}
+		}
+
+		// Create the message
+		sb.Reset()
+		if len(msgID) > 0 {
+			sb.WriteString("@reply-parent-msg-id=")
+			sb.WriteString(msgID)
+			sb.WriteString(" ")
+		}
+		sb.WriteString("PRIVMSG #")
+		sb.WriteString(strings.ToLower(CHANNEL_NAME))
+		sb.WriteString(" :")
+		sb.WriteString(msg[start:end])
+		sb.WriteString("\r\n")
+		sendQueue.Queue = append(sendQueue.Queue, sb.String())
+
+		start = end
+		if end >= len(msg) {
+			break
+		}
 	}
-	sb.WriteString("PRIVMSG #")
-	sb.WriteString(strings.ToLower(CHANNEL_NAME))
-	sb.WriteString(" :")
-	sb.WriteString(msg)
-	sb.WriteString("\r\n")
 
-	sendQueue.push(sb.String())
-
-	// if (end == message.Length) break;
-	// start = end + 1;
-	// end += MESSAGESENTMAXLEN;
-	// if (end > message.Length) end = message.Length;
-	// }
+	sendQueue.PendingMessages = true
+	sendQueue.mutex.Unlock()
 }
 
 // Chat message metadata
